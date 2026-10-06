@@ -1,0 +1,149 @@
+import pytest
+from unittest.mock import patch, MagicMock
+from veritensor.engines.static.dependency_engine import scan_dependencies, _is_typo
+
+def test_is_typo_logic():
+    """
+    Validates the core Levenshtein distance algorithm (D=1).
+    Ensures substitutions, deletions, and insertions are caught correctly.
+    """
+    # Substitution
+    assert _is_typo("turch", "torch") is True
+    # Deletion (checks normalization handling as well)
+    assert _is_typo("pndas", "pandas") is True
+    # Insertion
+    assert _is_typo("ttorch", "torch") is True
+    # Normalization check (py_cord vs py-cord should be same, thus distance 0, not 1)
+    assert _is_typo("py_cord", "py-cord") is False 
+    # Too many differences
+    assert _is_typo("tor", "torch") is False
+
+def test_scan_requirements_malware(tmp_path):
+    """Checks detection of known malicious entries in requirements.txt."""
+    f = tmp_path / "requirements.txt"
+    f.write_text("tourch==1.0\nnumpy\n")
+    
+    with patch("requests.post") as mock_post:
+        threats = scan_dependencies(f)
+    
+    assert any("Known malicious" in t and "tourch" in t for t in threats)
+
+def test_scan_poetry_lock_malware(tmp_path):
+    """
+    Checks that poetry.lock is correctly parsed and scanned for typos.
+    """
+    f = tmp_path / "poetry.lock"
+    # Simplified poetry.lock format
+    content = """
+[[package]]
+name = "requests"
+version = "2.31.0"
+
+[[package]]
+name = "pndas"
+version = "1.5.0"
+"""
+    f.write_text(content)
+    
+    with patch("requests.post") as mock_post:
+        threats = scan_dependencies(f)
+        
+    assert any("Potential Typosquatting" in t and "pandas" in t for t in threats)
+
+# Patch our custom get_safe_session instead of requests.post
+@patch("veritensor.engines.static.dependency_engine.get_safe_session")
+def test_scan_osv_vulnerability(mock_get_session, tmp_path):
+    """
+    Tests that vulnerabilities from OSV.dev are correctly reported.
+    Matches the specific message format of the new engine.
+    """
+    f = tmp_path / "requirements.txt"
+    f.write_text("requests==2.19.0\n")
+
+    # Simulate OSV API response via our safe session
+    mock_session = MagicMock()
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "results": [{
+            "vulns": [{
+                "id": "GHSA-m8th-934p-w6h3",
+                "summary": "Vulnerability in requests"
+            }]
+        }]
+    }
+    mock_session.post.return_value = mock_response
+    mock_get_session.return_value = mock_session
+
+    threats = scan_dependencies(f)
+    
+    assert mock_session.post.called
+    assert any("Vulnerability in requests==2.19.0" in t for t in threats)
+    assert any("GHSA-m8th-934p-w6h3" in t for t in threats)
+
+def test_scan_pipfile_lock_parsing(tmp_path):
+    """Checks parsing logic for Pipfile.lock (JSON format)."""
+    f = tmp_path / "Pipfile.lock"
+    content = """
+    {
+        "default": {
+            "tourch": {"version": "==1.0.0"}
+        }
+    }
+    """
+    f.write_text(content)
+    
+    with patch("requests.post") as mock_post:
+        threats = scan_dependencies(f)
+        
+    assert any("Known malicious" in t and "tourch" in t for t in threats)
+
+# Patch get_safe_session
+@patch("veritensor.engines.static.dependency_engine.get_safe_session")
+def test_scan_osv_offline_graceful(mock_get_session, tmp_path):
+    """Ensures scanner doesn't crash on network failure."""
+    f = tmp_path / "requirements.txt"
+    f.write_text("requests==2.19.0\n")
+
+    mock_session = MagicMock()
+    mock_session.post.side_effect = Exception("Network unreachable")
+    mock_get_session.return_value = mock_session
+
+    threats = scan_dependencies(f)
+    assert isinstance(threats, list)
+
+# ── C-7 REGRESSION: egg= URL parsing uses [1] not [-1] ───────────────────────
+
+def test_c7_regression_egg_in_vcs_url_detected(tmp_path):
+    """
+    C-7 regression: requirements.txt VCS URL with egg= anchor must correctly
+    extract the package name using split('egg=', 1)[1], not split('egg=')[-1].
+
+    With split('egg=')[-1]:
+      URL: git+https://...#egg=tourch&extra=egg=notthepackage
+      Result: "notthepackage" → NOT in KNOWN_MALICIOUS → missed!
+
+    With split('egg=', 1)[1]:
+      Result: "tourch&extra=egg=notthepackage" → split('&')[0] = "tourch" → detected!
+    """
+    f = tmp_path / "requirements.txt"
+    f.write_text(
+        "git+https://github.com/evil-org/repo.git@main"
+        "#egg=tourch&extra_option=egg=not_the_package\n"
+    )
+    with patch("requests.post"):
+        threats = scan_dependencies(f)
+
+    assert any("Known malicious" in t and "tourch" in t for t in threats), (
+        "C-7 regression: split('egg=')[-1] returned wrong package name "
+        "when URL contains 'egg=' more than once."
+    )
+
+
+def test_egg_simple_vcs_url_still_works(tmp_path):
+    """Regression guard: normal egg= URL (no double occurrence) still works."""
+    f = tmp_path / "requirements.txt"
+    f.write_text("git+https://github.com/evil/repo.git@main#egg=tourch\n")
+    with patch("requests.post"):
+        threats = scan_dependencies(f)
+    assert any("tourch" in t for t in threats)

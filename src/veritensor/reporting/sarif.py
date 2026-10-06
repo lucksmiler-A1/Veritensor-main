@@ -1,0 +1,143 @@
+# Copyright 2026 Veritensor Security
+#
+# This module generates SARIF v2.1.0 reports.
+# It allows Veritensor to integrate natively with GitHub Advanced Security.
+
+import json
+from typing import List, Any
+from veritensor.core.types import ScanResult  
+from veritensor import __version__
+
+# --- Constants ---
+SARIF_VERSION = "2.1.0"
+SARIF_SCHEMA = "https://json.schemastore.org/sarif-2.1.0.json"
+TOOL_NAME = "Veritensor Security Scanner"
+TOOL_DRIVER_NAME = "Veritensor"
+
+# --- Rule Definitions ---
+VERITENSOR_RULES = [
+    {
+        "id": "VERITENSOR-001",
+        "name": "RemoteCodeExecution",
+        "shortDescription": {"text": "Critical RCE Risk Detected"},
+        "fullDescription": {"text": "The model contains code that executes arbitrary system commands (e.g., os.system, subprocess)."},
+        "defaultConfiguration": {"level": "error"},
+        "properties": {"tags": ["security", "rce", "critical"]}
+    },
+    {
+        "id": "VERITENSOR-002",
+        "name": "UnsafeDeserialization",
+        "shortDescription": {"text": "Unsafe Pickle Import"},
+        "fullDescription": {"text": "The model imports modules that are not in the allowlist. This poses a security risk during deserialization."},
+        "defaultConfiguration": {"level": "error"},
+        "properties": {"tags": ["security", "pickle", "deserialization"]}
+    },
+    {
+        "id": "VERITENSOR-003",
+        "name": "KerasLambdaLayer",
+        "shortDescription": {"text": "Malicious Keras Lambda Layer"},
+        "fullDescription": {"text": "A Keras Lambda layer was detected. These layers can contain arbitrary Python bytecode."},
+        "defaultConfiguration": {"level": "error"},
+        "properties": {"tags": ["security", "keras", "rce"]}
+    },
+    {
+        "id": "VERITENSOR-004",
+        "name": "IntegrityMismatch",
+        "shortDescription": {"text": "Model Hash Mismatch"},
+        "fullDescription": {"text": "The file hash does not match the official registry (Hugging Face). The file may be corrupted or tampered with."},
+        "defaultConfiguration": {"level": "warning"},
+        "properties": {"tags": ["security", "integrity", "supply-chain"]}
+    },
+    {
+        "id": "VERITENSOR-005",
+        "name": "MCPAgentHijacking",
+        "shortDescription": {"text": "MCP Agent Tool Security Risk"},
+        "fullDescription": {"text": "An MCP tool exposes dangerous OS/DB/file operations without human-in-the-loop confirmation, enabling prompt injection attacks."},
+        "defaultConfiguration": {"level": "error"},
+        "properties": {"tags": ["security", "mcp", "agent", "prompt-injection"]}
+    },
+    {
+        "id": "VERITENSOR-006",
+        "name": "PIIDataLeak",
+        "shortDescription": {"text": "PII Data Exposure"},
+        "fullDescription": {"text": "Personally Identifiable Information detected in training data or model outputs."},
+        "defaultConfiguration": {"level": "warning"},
+        "properties": {"tags": ["privacy", "pii", "gdpr", "data-governance"]}
+    },
+    {
+        "id": "VERITENSOR-007",
+        "name": "DataPoisoning",
+        "shortDescription": {"text": "Dataset Poisoning / Prompt Injection in Training Data"},
+        "defaultConfiguration": {"level": "error"},
+        "properties": {"tags": ["security", "data-poisoning", "supply-chain"]}
+    }
+]
+
+
+def generate_sarif_report(scan_results: List[ScanResult], tool_version: str = __version__) -> str:
+    """
+    Converts internal Veritensor scan results (Objects) into a SARIF JSON string.
+    """
+    
+    sarif_results = []
+
+    for file_res in scan_results:
+        if file_res.status == "PASS":
+            continue
+
+        file_path = file_res.file_path
+        threats = file_res.threats
+
+        for threat_msg in threats:
+            # Skip informational messages — SARIF is for actionable security findings only
+            if threat_msg.startswith("INFO:") or threat_msg.startswith("WARNING:"):
+                continue
+                
+            rule_id = _map_threat_to_rule_id(threat_msg)
+            
+            result = {
+                "ruleId": rule_id,
+                # Map Veritensor severity to SARIF level
+                "level": "warning" if "MEDIUM" in threat_msg or "LOW" in threat_msg else "error",
+                "message": {"text": threat_msg},
+                "locations": [{"physicalLocation": {"artifactLocation": {"uri": file_path}}}]
+            }
+            sarif_results.append(result)
+
+    # Construct the full SARIF object
+    report = {
+        "$schema": SARIF_SCHEMA,
+        "version": SARIF_VERSION,
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": TOOL_DRIVER_NAME,
+                        "fullName": TOOL_NAME,
+                        "version": __version__,
+                        "rules": VERITENSOR_RULES
+                    }
+                },
+                "results": sarif_results
+            }
+        ]
+    }
+
+    return json.dumps(report, indent=2)
+
+
+def _map_threat_to_rule_id(threat_msg: str) -> str:
+    msg_lower = threat_msg.lower()
+    if "mcp" in msg_lower or "agent hijacking" in msg_lower:
+        return "VERITENSOR-005"
+    if "pii" in msg_lower or "credit_card" in msg_lower or "email_address" in msg_lower:
+        return "VERITENSOR-006"
+    if "data poisoning" in msg_lower or "prompt injection" in msg_lower:
+        return "VERITENSOR-007"
+    if "lambda" in msg_lower and "keras" in msg_lower:
+        return "VERITENSOR-003"
+    if "os." in msg_lower or "subprocess" in msg_lower or "eval" in msg_lower:
+        return "VERITENSOR-001"
+    if "hash" in msg_lower or "mismatch" in msg_lower:
+        return "VERITENSOR-004"
+    return "VERITENSOR-002"

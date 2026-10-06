@@ -1,0 +1,249 @@
+# Copyright 2026 Veritensor Security
+# Logic adapted from AIsbom (Apache 2.0 License)
+
+import io
+import requests
+import logging
+from urllib.parse import urlparse
+from typing import Optional, List, Any
+from veritensor.core.networking import get_safe_session
+import re
+from veritensor.core.networking import get_safe_session
+
+logger = logging.getLogger(__name__)
+
+# --- Optional AWS Import ---
+try:
+    import boto3
+    from botocore import UNSIGNED
+    from botocore.config import Config
+    from botocore.exceptions import NoCredentialsError, ClientError
+    AWS_AVAILABLE = True
+except ImportError:
+    AWS_AVAILABLE = False
+
+ALLOWED_DOMAINS = {"huggingface.co", "cdn-lfs.huggingface.co"}
+
+class RemoteStream(io.IOBase):
+    """
+    A file-like object that reads data from a URL using HTTP Range headers.
+    """
+    def __init__(self, url: str, session: Optional[requests.Session] = None):
+        self._validate_url(url)
+        self.url = url
+        self._session = session or get_safe_session(self.url)
+        self.pos = 0
+        self.size = self._fetch_size()
+      
+
+    def _validate_url(self, url: str):
+        try:
+            parsed = urlparse(url)
+            if parsed.scheme not in ("http", "https"):
+                raise ValueError(f"Invalid scheme: {parsed.scheme}")
+
+            domain = parsed.netloc.lower()
+            is_allowed = (domain in ALLOWED_DOMAINS) or (domain.endswith(".huggingface.co"))
+
+            # Strict domain allowlist enforcement.
+            if not is_allowed:
+                raise ValueError(
+                    f"SSRF Protection: Domain '{domain}' is not in the allowed list "
+                    f"({', '.join(ALLOWED_DOMAINS)}). "
+                    f"Only HuggingFace domains are permitted for remote streaming."
+                )
+
+        except ValueError:
+            raise
+        except Exception as e:
+            raise ValueError(f"Invalid URL format: {e}")
+
+    def _fetch_size(self) -> int:
+        try:
+            headers = {"Range": "bytes=0-0"}
+            resp = self._session.get(self.url, headers=headers, stream=True, timeout=10)
+            resp.raise_for_status()
+                
+            content_range = resp.headers.get("Content-Range")
+            if content_range and "/" in content_range:
+                return int(content_range.split("/")[-1])
+            
+            if "Content-Length" in resp.headers:
+                return int(resp.headers["Content-Length"])
+            
+            return 0
+        except Exception as e:
+            logger.error(f"Failed to fetch size for {self.url}: {e}")
+            raise
+
+
+    def read(self, size: int = -1) -> bytes:
+        if self._closed: raise ValueError("I/O operation on closed file.")
+        if self.pos >= self.size: return b""
+
+        if size is None or size < 0:
+            end = self.size - 1
+        else:
+            end = min(self.pos + size - 1, self.size - 1)
+
+        if end < self.pos: return b""
+
+        headers = {"Range": f"bytes={self.pos}-{end}"}
+        try:
+            #  Use safe session
+            resp = self._session.get(self.url, headers=headers, timeout=30)
+            resp.raise_for_status()
+            data = resp.content
+            self.pos += len(data)
+            return data
+        except Exception as e:
+            logger.error(f"Read error at offset {self.pos}: {e}")
+            raise
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        if self._closed: raise ValueError("I/O operation on closed file.")
+        if whence == 0: new_pos = offset
+        elif whence == 1: new_pos = self.pos + offset
+        elif whence == 2: new_pos = self.size + offset
+        else: raise ValueError(f"Invalid whence value: {whence}")
+        self.pos = max(0, min(new_pos, self.size))
+        return self.pos
+
+    def tell(self) -> int: return self.pos
+    def seekable(self) -> bool: return True
+    def readable(self) -> bool: return True
+    def close(self):
+        # Properly close the session and call super().close()
+        if not self.closed:
+            super().close()  # This sets self.closed = True and flushes
+            if hasattr(self, '_session'):
+                self._session.close()
+
+    def __enter__(self): return self
+    def __exit__(self, exc_type, exc, tb): self.close()
+
+
+class S3Stream(io.IOBase):
+    """
+    A file-like object that reads data from S3 using Range requests.
+    """
+    def __init__(self, s3_url: str):
+        if not AWS_AVAILABLE:
+            raise ImportError("AWS support not installed. Run 'pip install veritensor[aws]'")
+
+        parsed = urlparse(s3_url)
+        self.bucket = parsed.netloc
+        self.key = parsed.path.lstrip("/")
+        self.pos = 0
+   
+
+        # 1. Try standard client
+        self.s3 = boto3.client("s3")
+        
+        try:
+            self.size = self._fetch_size()
+        except (NoCredentialsError, ClientError) as e:
+            error_code = e.response['Error']['Code'] if hasattr(e, 'response') else ""
+            if "404" in str(error_code):
+                logger.error(f"S3 Object not found: {s3_url}")
+                raise
+
+            # 2. Fallback: Anonymous
+            logger.info(f"AWS Creds failed ({error_code}). Trying anonymous access for {s3_url}...")
+            self.s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
+            self.size = self._fetch_size()
+
+    def _fetch_size(self) -> int:
+        try:
+            response = self.s3.head_object(Bucket=self.bucket, Key=self.key)
+            return response['ContentLength']
+        except Exception as e:
+            logger.error(f"Failed to fetch size for s3://{self.bucket}/{self.key}: {e}")
+            raise
+
+    def read(self, size: int = -1) -> bytes:
+        if self._closed: raise ValueError("I/O operation on closed file.")
+        if self.pos >= self.size: return b""
+
+        if size is None or size < 0:
+            end = self.size - 1
+        else:
+            end = min(self.pos + size - 1, self.size - 1)
+
+        if end < self.pos: return b""
+
+        range_header = f"bytes={self.pos}-{end}"
+        try:
+            # Use boto3 get_object instead of requests
+            resp = self.s3.get_object(Bucket=self.bucket, Key=self.key, Range=range_header)
+            data = resp["Body"].read()
+            self.pos += len(data)
+            return data
+        except Exception as e:
+            logger.error(f"S3 Read error at offset {self.pos}: {e}")
+            raise
+
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        if self._closed: raise ValueError("I/O operation on closed file.")
+        if whence == 0: new_pos = offset
+        elif whence == 1: new_pos = self.pos + offset
+        elif whence == 2: new_pos = self.size + offset
+        else: raise ValueError(f"Invalid whence value: {whence}")
+        self.pos = max(0, min(new_pos, self.size))
+        return self.pos
+
+    def tell(self) -> int: return self.pos
+    def seekable(self) -> bool: return True
+    def readable(self) -> bool: return True
+    def close(self):
+        # Call super().close() to properly update io.IOBase state
+        if not self.closed:
+            super().close()
+
+    def __enter__(self): return self
+    def __exit__(self, exc_type, exc, tb): self.close()
+
+def get_stream_for_path(path: str):
+    """Factory to get correct stream (S3 or HTTP)."""
+    if path.startswith("s3://"):
+        return S3Stream(path)
+    elif path.startswith("http://") or path.startswith("https://"):
+        return RemoteStream(path)
+    else:
+        return open(path, "rb")
+
+def resolve_huggingface_repo(repo_id: str) -> List[str]:
+    """
+    Queries the Hugging Face API to get direct file URLs for a repository.
+    Handles 'hf://' prefix.
+    """
+    if repo_id.startswith("hf://"):
+        repo_id = repo_id[len("hf://"):]
+    api_url = f"https://huggingface.co/api/models/{repo_id}/tree/main"
+    
+    # Validate repo_id format to prevent path traversal or URL injection
+    if not re.match(r'^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$', repo_id):
+        logger.error(f"Invalid HuggingFace repo_id format: {repo_id}")
+        return []
+        
+    api_url = f"https://huggingface.co/api/models/{repo_id}/tree/main"
+    
+    try:
+        # Use safe session to enforce SSRF protection on the outbound request
+        safe_session = get_safe_session()
+        with safe_session:
+            resp = safe_session.get(api_url, timeout=10)
+            resp.raise_for_status()
+            files_info = resp.json()
+    except Exception as e:
+        logger.error(f"Failed to resolve HF repo {repo_id}: {e}")
+        return []
+        
+    supported_exts = (".pt", ".pth", ".bin", ".safetensors", ".gguf", ".pkl")
+    urls = []
+    for entry in files_info:
+        path = entry.get("path", "")
+        if any(path.endswith(ext) for ext in supported_exts):
+            urls.append(f"https://huggingface.co/{repo_id}/resolve/main/{path}")
+    return urls
